@@ -1,0 +1,6 @@
+_output/
+.quarto/
+*_files/
+*.quarto_ipynb
+.Rhistory
+.DS_Store

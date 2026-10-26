@@ -1,0 +1,378 @@
+---
+title: "MPG ~ manufacturer, analysis"
+author: "Prateek"
+date: "2025-11-23"
+categories: [random effects, hierarchical models]
+image: "mpg.jpg"
+toc: true
+bibliography: references.bib
+abstract: |
+  How much does city fuel economy vary across car manufacturers? Using the *mpg* dataset, we examine gas, front‑wheel‑drive compact, midsize, and subcompact cars from 1999–2008. We compare manufacturers while adjusting for engine size and model year, and we also account for the fact that each manufacturer offers several models. The key findings are: bigger engines get worse city mileage (intuitive), and once engine size is considered, transmission type and vehicle class have negligible effect. Even after adjusting for engine size and year, typical city mpg still differs by manufacturer by about ±6%, indicating that manufacturers have inherent differences in city fuel economy.
+execute:
+  echo: false
+---
+
+```{r}
+#| echo: false
+#| warning: false
+
+library(tidyverse)
+library(lme4)
+library(faraway)
+library(RLRsim)
+library(patchwork)
+
+theme_set(theme_minimal())
+```
+
+## Introduction
+
+Fuel economy matters for consumers and environmental policy. We ask a focused question: after accounting for observable vehicle attributes, do manufacturers differ in typical city fuel economy?
+
+Conceptually, we aim to separate manufacturer level differences from variation attributable to specific models. To that end, we compare manufacturers while adjusting for key covariates and explicitly distinguish manufacturers from model level effects so that inferences about brands are not confounded by the mix of models.
+
+The sections that follow describe the data and filtering choices, explore salient patterns, and then fit benchmark and hierarchical models with accompanying diagnostics, before concluding with implications and limitations.
+
+## Data
+
+The data come from the mpg dataset [@ggplot2]. We focus on front‑wheel‑drive petrol cars in the compact, midsize, and subcompact classes to keep the comparison balanced. Because models were selected based on having new releases across 1999–2008 (used as a proxy for popularity), manufacturers appear in the sample according to availability rather than a strict experimental design. This affects whether manufacturers are best treated as random or fixed effects.
+
+On one hand, manufacturers could be treated as random effects because they were not experimentally selected; on the other hand, we are interested in manufacturer‑specific differences, so treating manufacturers as fixed effects would be useful if each manufacturer is well represented. After filtering the data some manufacturers are missing or sparsely represented, so the scope of inference is limited — we can test whether manufacturers differ, but precise fixed‑effect estimates for every manufacturer would be unreliable.
+
+Models are treated as random and are nested inside manufacturers because the sample contains multiple models per manufacturer and the particular models present are effectively a random sample from all possible models.
+
+```{r}
+#| echo: false
+df_mpg <- mpg %>%
+  filter(
+    drv == "f" &
+      class %in% c("compact", "midsize", "subcompact") &
+      fl %in% c("p", "r") &
+      cyl != 5
+  ) %>%
+  mutate(
+    trans_recoded = if_else(str_detect(trans, 'auto'), 'auto', 'manual')
+  ) %>%
+  select(-trans, -drv, -hwy) %>%
+  mutate(
+    model = tolower(model),
+    manufacturer = tolower(manufacturer),
+    year = as.factor(year)
+  ) %>%
+  rename(
+    mpg = cty,
+    trans = trans_recoded
+  )
+
+knitr::kable(df_mpg %>% sample_n(size = 10))
+
+```
+
+Because of the way the data is collected, (selection of models which had a new release every year between 1999 and 2008 - this was used as a proxy for the popularity of the car), we need to be careful about how manufacturers are treated in the analysis. On one hand it seems only fair to treat manufacturers as also being random, since these were not specifically selected in the design of experiment (like car *model* these appear randomly in the data based on popularity criteria) [@extending_lm_with_R_book]. On the other hand, we are interested in the actual differences between manufacturers, so treating them as fixed effects is desirable. <br/>
+However, to warrant the use of fixed effects for manufacturers, we need to have sufficient data for each manufacturer and post filtering, the data should have all the manufacturers of interest. As can be seen this is not the case. <br/>
+
+```{r}
+#| echo: false
+df_plot <- mpg %>%
+  group_by(manufacturer) %>%
+  summarise(original_dataset = n()) %>%
+  left_join(
+    df_mpg %>%
+      group_by(manufacturer) %>%
+      summarise(final_dataset = n()),
+    by = join_by('manufacturer')
+  ) %>%
+  mutate(
+    final_dataset = if_else(is.na(final_dataset), 0, final_dataset)
+  ) %>%
+  pivot_longer(
+    c(original_dataset, final_dataset),
+    names_to = 'source',
+    values_to = 'count'
+  )
+
+ggplot(df_plot) +
+  geom_bar(
+    aes(x = manufacturer, y = count, fill = source),
+    stat = 'identity',
+    position = 'dodge'
+  ) +
+  coord_flip()
+
+```
+
+It can be seen that several key manufacturers are missing from the final dataset, consequently we may only be able to answer questions like *Is the mpg among manufacturers significantly different?* as opposed to *What is the average mpg of manufacturers to be able to compare them more directly* <br/>
+Of course, the car models are random in the study design, so we will treat them as such. Although these are nested inside manufacturers. <br/>
+
+
+### EDA
+
+Data summary is as follows -
+
+```{r, results = 'asis'}
+#| echo: false
+
+df_mpg %>%
+  summarise(
+    total_rows = n(),
+    total_manufacturers = n_distinct(manufacturer),
+    total_models = n_distinct(model),
+    min_mpg = min(mpg),
+    max_mpg = max(mpg),
+    mean_mpg = mean(mpg),
+    total_years = n_distinct(year)
+  ) %>%
+  knitr::kable()
+
+df_mpg %>%
+  group_by(manufacturer, model) %>%
+  summarise(counts = n(), mean_mpg = round(mean(mpg), 1), .groups = 'drop') %>%
+  knitr::kable()
+
+```
+
+<br/>
+
+There are (exactly) two years of data covering 15 models. We treat year as a categorical variable rather than continuous. A short sample for one model is shown below.
+
+```{r}
+#| echo: false
+
+df_mpg %>% filter(model == 'a4') %>% arrange(year, displ) %>% knitr::kable()
+
+```
+
+We observe multiple rows per model/year because of different displacements and transmission types. The data only contain three distinct cylinder sizes (4, 6, 8), which is captured by displacement, so we remove cyl to simplify the analysis.
+
+```{r}
+#| echo: false
+print(
+  ggplot(
+    df_mpg %>% mutate(cyl = jitter(cyl, 0.2), displ = jitter(displ, 0.2))
+  ) +
+    geom_point(aes(x = cyl, y = displ), alpha = 0.5)
+)
+df_mpg <- df_mpg %>% select(-cyl)
+```
+
+Fuel type (regular vs premium) is not central to this study and shows little correlation with city mpg, so we drop the fuel type column as well.
+
+```{r}
+#| echo: false
+
+print(ggplot(df_mpg) + geom_boxplot(aes(x = fl, y = mpg, fill = fl)))
+df_mpg <- df_mpg %>% select(-fl)
+
+```
+
+
+We visualize how mpg varies across manufacturers and by other attributes to get an initial sense of the patterns.
+
+```{r}
+#| echo: false
+
+ggplot(df_mpg) +
+  geom_boxplot(aes(x = manufacturer, y = mpg, fill = manufacturer))
+
+```
+
+There does seem to be quite a lot of variability in the city mpg among manufacturers. <br/>
+Although, it is definitely possible that this is driven by different models and their attributes more than manufacturers themselves. <br/>
+
+The plot below suggests (to intuition) that with larger *displacement* the *mpg* reduces. Although there is a hint of nonlinearity in the trend, we shall ignore this initially. <br/>
+Midsize cars are slightly less efficient (lower mpg) than compact and subcompact cars. This is expected since these are heavier with higher displacement engines. <br/>
+It is hard to get an accurate read on the effect of transmission and so we shall defer it to the model to figure out.
+
+```{r}
+ggplot(df_mpg) +
+  geom_point(aes(x = displ, y = mpg, color = class, shape = trans)) +
+  facet_wrap(~manufacturer)
+
+```
+
+The mpg distribution has a right skew, so we take the logarithm of mpg to stabilize variance and to make regression coefficients interpretable as approximate percentage changes.
+
+```{r}
+#| echo: false
+
+manufacturers <- df_mpg %>% distinct(manufacturer) %>% pull(manufacturer)
+df_mpg_marginal <- df_mpg %>%
+  crossing(manufacturer_new = manufacturers) %>%
+  mutate(class = 'overall', manufacturer = manufacturer_new)
+
+ggplot(df_mpg, aes(x = log(mpg), colour = class)) +
+  geom_density(, alpha = 0.5) +
+  geom_density(
+    data = df_mpg_marginal,
+    alpha = 0.5,
+    colour = 'black'
+  ) +
+  facet_wrap(~manufacturer)
+
+```
+
+## Analysis
+
+### Baseline model
+
+We start with a simple linear model that includes manufacturer as a fixed effect along with displacement and year. This fixed‑effects model provides a baseline and helps identify which predictors explain the most variation in log(mpg). Transmission and class become less important after accounting for displacement and manufacturer, so we simplify the model accordingly.
+
+```{r}
+#| echo: false
+
+mod <- lm(
+  log(mpg) ~ manufacturer + displ + class + trans + year,
+  data = df_mpg
+)
+anova(mod)
+
+```
+
+It can be seen that *manufacturer* and *displ* are highly significant predictors of log(mpg). As seen in the plot earlier, 1L increase in displacement can reduce MPG by ~15% (coefficient `r round(coef(mod)[['displ']], 3)` on the log scale, i.e. `r round(100 * (1 - exp(coef(mod)[['displ']])))`% lower mpg per litre) <br/>
+Transmission is not significant in the presence of other predictors as was the observation from plot earlier. <br/>
+Class is not significant either, although this may be due to confounding with displacement as suspected before.
+A formal test of displacement being positively related with class for any given model also validates this finding. <br/>
+
+```{r}
+#| echo: false
+
+print(
+  ggplot(df_mpg) +
+    geom_boxplot(aes(x = class, y = displ, fill = class))
+)
+
+anova(
+  lm(
+    displ ~ class + model,
+    data = df_mpg
+  )
+)
+
+```
+
+Consequently we can simplify the model by removing *trans* and *class*, which results in a decent fit to the data and diagnostics are satisfactory.
+
+```{r}
+#| echo: false
+
+mod <- lm(
+  log(mpg) ~ manufacturer + displ + year,
+  data = df_mpg
+)
+par(mfrow = c(2, 2))
+plot(mod)
+par(mfrow = c(1, 1))
+
+```
+
+### Mixed effects model
+
+Because models are nested within manufacturers and the specific models in the data are essentially a random sample, we fit mixed‑effects models that include random intercepts for manufacturer and for model nested within manufacturer. This accounts for the correlation between observations from the same model and between models from the same manufacturer.
+
+```{r}
+#| echo: false
+
+cmod <- lmer(
+  log(mpg) ~ displ + year + (1 | manufacturer) + (1 | manufacturer:model),
+  data = df_mpg,
+  REML = TRUE
+)
+
+sumary(cmod)
+
+```
+
+It can be seen that variance due to manufacturer and models nested inside manufacturer are comparable in magnitudes. The variation in mpg is due to both, which is a sensible outcome. <br/>
+
+It can be tested if including model effects is meaningful using a likelihood ratio test. [@rlrsim]
+
+```{r}
+#| echo: false
+
+cmods <- lmer(
+  log(mpg) ~ displ + year + (1 | manufacturer:model),
+  data = df_mpg,
+  REML = TRUE
+)
+
+cmodr <- lmer(
+  log(mpg) ~ displ + year + (1 | manufacturer),
+  data = df_mpg,
+  REML = TRUE
+)
+
+exactRLRT(cmods, cmod, cmodr)
+
+```
+
+So we reject the hypothesis that manufacturer:model nesting effect is not significant. <br/>
+
+Additionally we can check confidence intervals for variance components.
+Manufacturer variance intervals do not contain 0.
+
+```{r}
+#| echo: false
+
+knitr::kable(confint(cmod, method = 'boot', nsim = 1000))
+
+```
+
+#### Diagnostics
+
+Residual diagnostics suggest approximate normality and roughly constant variance. Random‑effect Q–Q plots indicate the manufacturer:model random effects are reasonably close to normal; manufacturer effects are also approximately normal.
+
+```{r}
+#| echo: false
+
+diagd <- fortify.merMod(cmod)
+
+p1 <- ggplot(diagd, aes(sample = .resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(
+    title = "Q-Q plot of residuals",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  )
+
+p2 <- ggplot(diagd, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residuals vs Fitted Values",
+    x = "Fitted Values",
+    y = "Residuals"
+  )
+
+p1 + p2
+
+```
+
+We can also check the assumption of normality of random effects, which holds up reasonably well (particularly for manufacturer:model).
+
+```{r}
+#| echo: false
+
+par(mfrow = c(1, 2))
+qqnorm(
+  ranef(cmod)$manufacturer[[1]],
+  main = "Manufacturer RE"
+)
+qqline(ranef(cmod)$manufacturer[[1]], col = "red")
+
+qqnorm(
+  ranef(cmod)$`manufacturer:model`[[1]],
+  main = "Manufacturer:Model RE"
+)
+qqline(ranef(cmod)$`manufacturer:model`[[1]], col = "red")
+
+par(mfrow = c(1, 1))
+```
+
+## Conclusion
+
+We set out to test whether manufacturers differ in city mpg after controlling for other attributes. Accounting for model‑level clustering, year and displacement, we find remaining manufacturer‑level variation in city mpg. In other words, even after controlling for model and engine size, manufacturers differ in typical city mpg. <br/>
+
+The variability among manufacturers is of the order of +/- 6%, which translates to +/-1.2 mpg on average  <br/>
+
+Limitations: this analysis is limited to petrol, front‑wheel‑drive cars in the compact/midsize/subcompact classes. Results should not be generalized beyond these groups without further study. Results are also sensitive to the treatment of manufacturers as random effects due to the sampling design.
